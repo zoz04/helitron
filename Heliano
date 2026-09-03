@@ -1,0 +1,25 @@
+#gerando o instalador
+wget "https://github.com/conda-forge/miniforge/releases/latest/download/Miniforge3-$(uname)-$(uname -m).sh"
+bash Miniforge3-$(uname)-$(uname -m).sh
+#instalando
+conda install -n base -c conda-forge mamba -y
+#confirmando se foi instalado
+mamba --version
+#criando e ativando o ambiente
+mamba create -n heliano -c conda-forge -c bioconda zhenlisme::heliano
+mamba activate heliano #ver se ele roda minusculo(esperado) ou maiusculo HELIANO
+#obs: Um detalhe à parte: percebi que você tem duas instalações conda distintas na máquina — o mamba/miniforge novo (~/.local/share/mamba) e um miniconda3 mais antigo (~/miniconda3, com os ambientes goplot, gorich, methylkit e um HELIANO próprio). Isso não deve causar problema agora, mas fique atento para sempre ativar o ambiente certo (mamba activate HELIANO usa o do miniforge, que é o que tem o heliano instalado corretamente).
+#rodar heliano
+heliano -g ~/enzo/Psta.fa   -is1 1 -is2 1 -p 1e-5 -s 30 -pt 1 -sim_tir 100   -o pstaminea_heliano_opt -w 15000 -n 8
+#-is1 1 -is2 1 → considera apenas os sítios de inserção preferenciais (mais restritivo)
+#-p 1e-5 → p-value de corte mais rigoroso para o teste de Fisher
+#-s 30 → tamanho mínimo de similaridade/score (conforme recomendação da doc)
+#-pt 1 → parâmetro específico para HLE1 (Helitrons)
+#-sim_tir 100 → exige 100% de similaridade nos TIRs (só relevante para HLE2)
+#-n 8 → ajuste para o número de núcleos disponíveis na sua máquina (rode nproc para conferir quantos tem)
+
+#rodar dentro de uma sessao de screen
+screen -S heliano_pitcairnias2
+#entao, dentro dela roda o comando
+heliano -g ~/enzo/Psta.fa -is1 1 -is2 1 -p 1e-5 -s 30 -pt 1 -sim_tir 100 -o pstaminea_heliano_opt2 -w 15000 -n 8
+Ctrl+A depois D # pra sair sem descontinuar a sessao
