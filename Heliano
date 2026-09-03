@@ -23,3 +23,5 @@ screen -S heliano_pitcairnias2
 #entao, dentro dela roda o comando
 heliano -g ~/enzo/Psta.fa -is1 1 -is2 1 -p 1e-5 -s 30 -pt 1 -sim_tir 100 -o pstaminea_heliano_opt2 -w 15000 -n 8
 Ctrl+A depois D # pra sair sem descontinuar a sessao
+#pra voltar e acompanhar o progresso depois
+screen -r heliano_pitcairnias2
