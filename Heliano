@@ -25,3 +25,35 @@ heliano -g ~/enzo/Psta.fa -is1 1 -is2 1 -p 1e-5 -s 30 -pt 1 -sim_tir 100 -o psta
 Ctrl+A depois D # pra sair sem descontinuar a sessao
 #pra voltar e acompanhar o progresso depois
 screen -r heliano_pitcairnias2
+
+##############################################################################################
+#para interpretar os resultados, em RC.representative.bed, que contem as coordenadas de cada HLE detectado classifica em subfam
+cd caminho/para/pstaminea_heliano_opt   # ajuste pro diretório de saída
+
+# total de elementos detectados
+wc -l RC.representative.bed
+
+# quantas subfamílias distintas (coluna 4)
+cut -f4 RC.representative.bed | sort -u | wc -l
+
+# top 10 subfamílias mais frequentes
+cut -f4 RC.representative.bed | sort | uniq -c | sort -rn | head -10
+
+# proporção HLE1 vs HLE2 (coluna 9)
+cut -f9 RC.representative.bed | sort | uniq -c
+
+# proporção auto / nonauto / orfonly (coluna 10)
+cut -f10 RC.representative.bed | sort | uniq -c
+
+# quantos elementos por scaffold/cromossomo (coluna 1)
+cut -f1 RC.representative.bed | sort | uniq -c | sort -rn
+
+# distribuição de fita (+ / -)
+cut -f6 RC.representative.bed | sort | uniq -c
+
+# tamanho médio dos elementos (end - start)
+awk '{print $3-$2}' RC.representative.bed | awk '{sum+=$1; n++} END {print "Média:", sum/n, "pb | Total elementos:", n}'
+
+# menor e maior elemento
+awk '{print $3-$2}' RC.representative.bed | sort -n | head -1
+awk '{print $3-$2}' RC.representative.bed | sort -n | tail -1
