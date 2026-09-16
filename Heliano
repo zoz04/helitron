@@ -57,3 +57,7 @@ awk '{print $3-$2}' RC.representative.bed | awk '{sum+=$1; n++} END {print "Méd
 # menor e maior elemento
 awk '{print $3-$2}' RC.representative.bed | sort -n | head -1
 awk '{print $3-$2}' RC.representative.bed | sort -n | tail -1
+
+####################################################################
+#pra achar um arquivo
+ find /caminho/para/procurar -name "palbiflos_heliano_opt2"
