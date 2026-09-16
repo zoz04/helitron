@@ -1,0 +1,7 @@
+#filtrar helitrons por homologia e estrutura. homologia> 0.8 
+
+#4 arquivos gff3 serao gerados
+
+#rodar um script com os gff3 a metodologia citada abaixo
+#2.8 Orthologous Helitron loci analysis in five species of Brassicaceae
+In order to analyze the orthologous Helitron elements in different species, we introduced a method that was used to analyze the orthologous nuclear mitochondrial DNA segment loci in bird genomes (Liang et al., 2018). We first reconstructed a phylogenetic tree of the nine Brassicaceae species with Amborella trichopoda (Baill.) as an outgroup. The complete chloroplast genome sequences of these species were downloaded from NCBI and aligned using MAFFT (version 7; Katoh & Standley, 2013). A phylogenetic tree was constructed by using FastTree 2 (Price et al., 2010). Then a group of five species were selected for orthologous Helitron loci analysis. For each Helitron element, the 5′ terminal 50 bp and 3′ terminal 50 bp were extracted, connected, and evaluated by all-by-all BlastN search. Next, we extended each Helitron hit to include 200 bp of flanking sequences at each end, and all-by-all BlastN searches were carried out. Finally, we identified orthologous Helitron loci in these species. That is, a Helitron element in one species showed 80% sequence similarity with a Helitron element in another species, both for the Helitron sequence and the flanking sequences. Thus, these two Helitron loci were considered as orthologous Helitron loci.
