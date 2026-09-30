@@ -13,4 +13,541 @@ In order to analyze the orthologous Helitron elements in different species, we i
   5) Um par de Helitrons de espécies diferentes é considerado ORTÓLOGO somente se PASSAR o corte de >=80% de identidade E cobertura tanto no bloco (a) quanto no bloco (b) — exatamente o critério "both for the Helitron sequence and the flanking sequences" do artigo.
   6) Pares ortólogos confirmados são agrupados em grafo -> componentes conectados = grupos de loci ortólogos (ortogrupos) através das N espécies. A partir disso é possível montar uma matriz de presença/ausência por espécie, útil para inferir ganhos/perdas linhagem-específicos e possíveis padrões de diferenciação.
 
+#para rodar o codigo, um dos arquivos necessarios é o de reuniao dos arquivos de dados de cada especie, sendo um desses dados o bed de anotaçao dos helitrons
+#como eu tinha apenas o gff3 de anotaçao dos tes em flammea, eu filtrei apenas os helitrons
+awk -F'\t' '{print $3}' RANCOL-TEs-TEanno.gff3 | sort -u | grep -i helitron # para conferir se era a coluna certa
+#awk: ferramenta para processar arquivos organizados em colunas.
+  -F'\t': diz ao awk que as colunas são separadas por TAB (padrão do formato GFF3).
+  '{print $3}': imprime só a 3ª coluna de cada linha.
+#sort: ordena as linhas.
+-u (unique): remove duplicatas, deixando só uma ocorrência de cada valor.
+#grep: filtra linhas que contêm um texto.
+-i: ignora maiúsculas/minúsculas (case-insensitive) — pega Helitron, helitron, HELITRON, etc.
+#ou simplesmente rodar um grep -i "helitron" RANCOL-TEs-TEanno.gff3
+
+#comando pra gerar o bed filtrado
+ awk -F'\t' 'BEGIN{OFS="\t"}
+  $3=="helitron" {
+    chrom=$1
+    start=$4-1          # GFF é 1-based; BED é 0-based
+    end=$5
+    strand=$7
+
+    # extrai o valor de ID=... até o primeiro ";"
+    match($9, /ID=[^;]+/)
+    locus_id=substr($9, RSTART+3, RLENGTH-3)
+
+    print locus_id, chrom, start, end, strand
+  }' RANCOL-TEs-TEanno.gff3 > RANCOL_helitrons.bed
+
+#rodar o codigo
+python3 helitron_orthology_pipeline.py \\
+    --config species_config.tsv \\
+    --outdir resultados_helitron \\
+    --term-len 50 \\
+    --flank-len 200 \\
+    --min-pident 80 \\
+    --min-qcov 80 \\
+    --evalue 1e-10 \\
+    --threads 4
+"""
+
+import argparse
+import itertools
+import logging
+import os
+import shutil
+import subprocess
+import sys
+from dataclasses import dataclass, field
+from typing import Dict, List, Tuple
+
+import pandas as pd
+import networkx as nx
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="[%(asctime)s] %(levelname)s: %(message)s",
+    datefmt="%H:%M:%S",
+)
+log = logging.getLogger("helitron_orthology")
+
+COMPLEMENT = str.maketrans("ACGTNacgtn", "TGCANtgcan")
+
+
+def revcomp(seq: str) -> str:
+    return seq.translate(COMPLEMENT)[::-1]
+
+
+# ---------------------------------------------------------------------------
+# Leitura de FASTA (implementação leve, sem dependência de Biopython)
+# ---------------------------------------------------------------------------
+def load_fasta(path: str) -> Dict[str, str]:
+    """Carrega um FASTA inteiro em memória: {header_id: sequence}."""
+    seqs: Dict[str, List[str]] = {}
+    current_id = None
+    with open(path) as fh:
+        for line in fh:
+            line = line.rstrip("\n")
+            if not line:
+                continue
+            if line.startswith(">"):
+                current_id = line[1:].split()[0]
+                seqs[current_id] = []
+            else:
+                if current_id is None:
+                    raise ValueError(f"FASTA malformado em {path}: sequência antes de cabeçalho.")
+                seqs[current_id].append(line.strip())
+    return {k: "".join(v) for k, v in seqs.items()}
+
+
+def write_fasta(records: List[Tuple[str, str]], path: str, width: int = 70) -> None:
+    with open(path, "w") as fh:
+        for header, seq in records:
+            fh.write(f">{header}\n")
+            for i in range(0, len(seq), width):
+                fh.write(seq[i:i + width] + "\n")
+
+
+# ---------------------------------------------------------------------------
+# Estruturas de dados
+# ---------------------------------------------------------------------------
+@dataclass
+class Helitron:
+    locus_id: str          # id original no arquivo de anotação
+    species: str
+    chrom: str
+    start: int              # 0-based
+    end: int                # exclusivo
+    strand: str
+
+    @property
+    def uid(self) -> str:
+        """Identificador único global (espécie + locus)."""
+        return f"{self.species}|{self.locus_id}"
+
+
+@dataclass
+class SpeciesConfig:
+    name: str
+    genome_fasta: str
+    annotation_bed: str
+    genome: Dict[str, str] = field(default_factory=dict, repr=False)
+
+
+# ---------------------------------------------------------------------------
+# Carregamento de config e anotações
+# ---------------------------------------------------------------------------
+def load_species_config(config_path: str) -> List[SpeciesConfig]:
+    species_list = []
+    with open(config_path) as fh:
+        for lineno, line in enumerate(fh, 1):
+            line = line.strip()
+            if not line or line.startswith("#"):
+                continue
+            parts = line.split("\t")
+            if len(parts) != 3:
+                raise ValueError(
+                    f"Linha {lineno} de {config_path} deveria ter 3 colunas "
+                    f"(species_name, genome_fasta, helitron_annotation_bed), "
+                    f"encontrado: {parts}"
+                )
+            name, genome_fasta, annotation_bed = parts
+            species_list.append(SpeciesConfig(name, genome_fasta, annotation_bed))
+    if len(species_list) < 2:
+        raise ValueError("É preciso pelo menos 2 espécies no arquivo de configuração.")
+    return species_list
+
+
+def load_helitrons(species: SpeciesConfig) -> List[Helitron]:
+    helitrons = []
+    with open(species.annotation_bed) as fh:
+        for lineno, line in enumerate(fh, 1):
+            line = line.strip()
+            if not line or line.startswith("#"):
+                continue
+            parts = line.split("\t")
+            if len(parts) < 5:
+                raise ValueError(
+                    f"Linha {lineno} de {species.annotation_bed} deveria ter >=5 "
+                    f"colunas (locus_id, chrom, start, end, strand)."
+                )
+            locus_id, chrom, start, end, strand = parts[:5]
+            helitrons.append(
+                Helitron(
+                    locus_id=locus_id,
+                    species=species.name,
+                    chrom=chrom,
+                    start=int(start),
+                    end=int(end),
+                    strand=strand.strip(),
+                )
+            )
+    log.info("  %s: %d Helitrons carregados de %s", species.name, len(helitrons), species.annotation_bed)
+    return helitrons
+
+
+# ---------------------------------------------------------------------------
+# Extração de sequências (junção terminal / núcleo / flancos)
+# ---------------------------------------------------------------------------
+def extract_terminal_junction(genome: Dict[str, str], h: Helitron, term_len: int) -> str:
+    """5' terminal term_len pb + 3' terminal term_len pb, na orientação biológica."""
+    chrom_seq = genome[h.chrom]
+    span = chrom_seq[h.start:h.end]
+    if len(span) < 2 * term_len:
+        # elemento curto demais para extrair 2x term_len sem sobreposição;
+        # ainda assim extrai o que for possível (sem sobrepor).
+        half = len(span) // 2
+        term_len_eff = min(term_len, half) if half > 0 else len(span)
+    else:
+        term_len_eff = term_len
+
+    five_prime = span[:term_len_eff]
+    three_prime = span[-term_len_eff:]
+
+    if h.strand == "-":
+        # span já foi extraído em coordenadas + da fita; para orientação
+        # biológica da fita -, invertemos e complementamos, e trocamos
+        # qual ponta é 5'/3'.
+        five_prime_bio = revcomp(span[-term_len_eff:])
+        three_prime_bio = revcomp(span[:term_len_eff])
+        return five_prime_bio + three_prime_bio
+
+    return five_prime + three_prime
+
+
+def extract_core_and_flanks(
+    genome: Dict[str, str], h: Helitron, flank_len: int
+) -> Tuple[str, str, str]:
+    """
+    Retorna (flank5, helitron_core, flank3) em orientação biológica,
+    truncando nos limites do contig/cromossomo quando necessário.
+    """
+    chrom_seq = genome[h.chrom]
+    chrom_len = len(chrom_seq)
+
+    core = chrom_seq[h.start:h.end]
+    left_flank_genomic = chrom_seq[max(0, h.start - flank_len):h.start]
+    right_flank_genomic = chrom_seq[h.end:min(chrom_len, h.end + flank_len)]
+
+    if h.strand == "-":
+        core_bio = revcomp(core)
+        flank5_bio = revcomp(right_flank_genomic)
+        flank3_bio = revcomp(left_flank_genomic)
+    else:
+        core_bio = core
+        flank5_bio = left_flank_genomic
+        flank3_bio = right_flank_genomic
+
+    return flank5_bio, core_bio, flank3_bio
+
+
+# ---------------------------------------------------------------------------
+# BLAST wrapper
+# ---------------------------------------------------------------------------
+BLAST_OUTFMT = "6 qseqid sseqid pident length mismatch gapopen qstart qend sstart send evalue bitscore qlen slen"
+BLAST_COLUMNS = BLAST_OUTFMT.split()[1:]  # todas as colunas, incluindo qseqid
+
+
+def check_blast_available():
+    for exe in ("makeblastdb", "blastn"):
+        if shutil.which(exe) is None:
+            raise EnvironmentError(
+                f"'{exe}' não encontrado no PATH. Instale o NCBI BLAST+ "
+                f"(https://www.ncbi.nlm.nih.gov/books/NBK569861/) antes de rodar o pipeline."
+            )
+
+
+def run_all_by_all_blastn(
+    fasta_path: str, out_tsv: str, evalue: str, threads: int, workdir: str
+) -> pd.DataFrame:
+    """Roda BLASTN all-by-all de um multi-FASTA contra ele mesmo."""
+    db_prefix = os.path.join(workdir, os.path.basename(fasta_path) + ".db")
+    subprocess.run(
+        ["makeblastdb", "-in", fasta_path, "-dbtype", "nucl", "-out", db_prefix],
+        check=True, capture_output=True, text=True,
+    )
+    cmd = [
+        "blastn",
+        "-query", fasta_path,
+        "-db", db_prefix,
+        "-out", out_tsv,
+        "-outfmt", BLAST_OUTFMT,
+        "-evalue", str(evalue),
+        "-num_threads", str(threads),
+    ]
+    subprocess.run(cmd, check=True, capture_output=True, text=True)
+
+    if os.path.getsize(out_tsv) == 0:
+        return pd.DataFrame(columns=BLAST_COLUMNS)
+
+    df = pd.read_csv(out_tsv, sep="\t", header=None, names=BLAST_COLUMNS)
+    return df
+
+
+def species_of(seq_id: str) -> str:
+    """seq_id no formato 'species|locus_id' -> retorna 'species'."""
+    return seq_id.split("|", 1)[0]
+
+
+def filter_cross_species_hits(
+    df: pd.DataFrame, min_pident: float, min_qcov: float
+) -> pd.DataFrame:
+    """
+    Remove hits de uma sequência contra ela mesma e hits dentro da mesma
+    espécie (não nos interessam ortólogos intra-específicos aqui), e
+    aplica cortes de identidade e cobertura da query.
+    """
+    if df.empty:
+        return df
+    df = df.copy()
+    df["qspecies"] = df["qseqid"].map(species_of)
+    df["sspecies"] = df["sseqid"].map(species_of)
+    df["qcovs"] = (df["length"] - df["gapopen"]) / df["qlen"] * 100.0
+
+    mask = (
+        (df["qseqid"] != df["sseqid"])
+        & (df["qspecies"] != df["sspecies"])
+        & (df["pident"] >= min_pident)
+        & (df["qcovs"] >= min_qcov)
+    )
+    return df.loc[mask].reset_index(drop=True)
+
+
+def pairs_from_df(df: pd.DataFrame) -> set:
+    """Conjunto de pares não-ordenados (frozenset) de seq_ids que se hitaram."""
+    return {frozenset((r.qseqid, r.sseqid)) for r in df.itertuples()}
+
+
+# ---------------------------------------------------------------------------
+# Pipeline principal
+# ---------------------------------------------------------------------------
+def main():
+    parser = argparse.ArgumentParser(
+        description="Identificação de loci ortólogos de Helitrons entre espécies "
+                    "(adaptado do item 2.8 de Wang et al., doi:10.1111/jse.12929).",
+        formatter_class=argparse.ArgumentDefaultsHelpFormatter,
+    )
+    parser.add_argument("--config", required=True, help="TSV: species_name, genome_fasta, annotation_bed")
+    parser.add_argument("--outdir", required=True, help="Diretório de saída")
+    parser.add_argument("--term-len", type=int, default=50, help="Tamanho da junção terminal (pb) em cada ponta")
+    parser.add_argument("--flank-len", type=int, default=200, help="Tamanho do flanco (pb) em cada ponta")
+    parser.add_argument("--min-pident", type=float, default=80.0, help="Identidade mínima (%%) para considerar ortólogo")
+    parser.add_argument("--min-qcov", type=float, default=80.0, help="Cobertura mínima da query (%%)")
+    parser.add_argument("--evalue", default="1e-10", help="E-value do BLASTN")
+    parser.add_argument("--threads", type=int, default=4, help="Threads para o BLASTN")
+    parser.add_argument(
+        "--require-clique", action="store_true",
+        help="Se definido, ortogrupos exigem que TODOS os pares dentro do grupo "
+             "sejam ortólogos confirmados (clique), em vez de apenas conectividade "
+             "transitiva (componente conexo). Mais estrito, pode fragmentar grupos.",
+    )
+    parser.add_argument(
+        "--skip-terminal-screen", action="store_true",
+        help="Pula a etapa 1 (screening por junção terminal de 2x term_len pb) e "
+             "usa apenas o critério final (núcleo + flanco >= min-pident/min-qcov) "
+             "para chamar ortólogos. A etapa 1 no artigo original serve para reduzir "
+             "custo computacional em buscas genoma-inteiro; com um número modesto de "
+             "Helitrons já anotados (caso típico de comparar poucas espécies), essa "
+             "janela curta (ex.: 100pb) pode gerar falsos negativos por ruído "
+             "estocástico. Recomendado ativar esta flag quando o número de Helitrons "
+             "por espécie for pequeno (dezenas a poucas centenas).",
+    )
+    args = parser.parse_args()
+
+    os.makedirs(args.outdir, exist_ok=True)
+    work = os.path.join(args.outdir, "_work")
+    os.makedirs(work, exist_ok=True)
+
+    check_blast_available()
+
+    log.info("1) Carregando configuração de espécies e anotações de Helitron...")
+    species_list = load_species_config(args.config)
+    all_helitrons: Dict[str, Helitron] = {}
+    for sp in species_list:
+        sp.genome = load_fasta(sp.genome_fasta)
+        for h in load_helitrons(sp):
+            all_helitrons[h.uid] = h
+
+    log.info("Total de Helitrons carregados (todas espécies): %d", len(all_helitrons))
+
+    genome_by_species = {sp.name: sp.genome for sp in species_list}
+
+    # ---------------- Etapa 1: junção terminal (screening) ----------------
+    log.info("2) Extraindo junções terminais (5' %dpb + 3' %dpb) e rodando BLASTN all-by-all...", args.term_len, args.term_len)
+    term_records = []
+    for uid, h in all_helitrons.items():
+        seq = extract_terminal_junction(genome_by_species[h.species], h, args.term_len)
+        term_records.append((uid, seq))
+    term_fasta = os.path.join(work, "terminal_junctions.fasta")
+    write_fasta(term_records, term_fasta)
+
+    term_blast_tsv = os.path.join(work, "terminal_junctions.blast.tsv")
+    term_df = run_all_by_all_blastn(term_fasta, term_blast_tsv, args.evalue, args.threads, work)
+    term_df_f = filter_cross_species_hits(term_df, args.min_pident, args.min_qcov)
+    stage1_pairs = pairs_from_df(term_df_f)
+    log.info("   Pares candidatos após screening por junção terminal: %d", len(stage1_pairs))
+
+    if args.skip_terminal_screen:
+        log.info("   (--skip-terminal-screen ativo: etapa 1 será IGNORADA no critério final; "
+                 "usada apenas para referência/auditoria em blast_terminal_junction_filtered.tsv)")
+    elif not stage1_pairs:
+        log.warning("Nenhum par candidato encontrado na etapa 1. Encerrando (ajuste os cortes de "
+                    "--min-pident/--min-qcov, ou rode com --skip-terminal-screen).")
+        write_empty_outputs(args.outdir)
+        return
+
+    # ---------------- Etapa 2: núcleo + flancos estendidos ----------------
+    log.info("3) Extraindo núcleo do Helitron + flancos de %dpb e rodando BLASTN all-by-all (núcleo e flanco separadamente)...", args.flank_len)
+    core_records = []
+    flank_records = []
+    for uid, h in all_helitrons.items():
+        flank5, core, flank3 = extract_core_and_flanks(genome_by_species[h.species], h, args.flank_len)
+        core_records.append((uid, core))
+        flank_records.append((uid, flank5 + flank3))
+
+    core_fasta = os.path.join(work, "helitron_core.fasta")
+    flank_fasta = os.path.join(work, "helitron_flanks.fasta")
+    write_fasta(core_records, core_fasta)
+    write_fasta(flank_records, flank_fasta)
+
+    core_blast_tsv = os.path.join(work, "helitron_core.blast.tsv")
+    flank_blast_tsv = os.path.join(work, "helitron_flanks.blast.tsv")
+    core_df = run_all_by_all_blastn(core_fasta, core_blast_tsv, args.evalue, args.threads, work)
+    flank_df = run_all_by_all_blastn(flank_fasta, flank_blast_tsv, args.evalue, args.threads, work)
+
+    core_df_f = filter_cross_species_hits(core_df, args.min_pident, args.min_qcov)
+    flank_df_f = filter_cross_species_hits(flank_df, args.min_pident, args.min_qcov)
+
+    core_pairs = pairs_from_df(core_df_f)
+    flank_pairs = pairs_from_df(flank_df_f)
+    log.info("   Pares com >=%.0f%% identidade/cobertura no núcleo do Helitron: %d", args.min_pident, len(core_pairs))
+    log.info("   Pares com >=%.0f%% identidade/cobertura no flanco: %d", args.min_pident, len(flank_pairs))
+
+    # ---------------- Critério final: interseção das etapas ----------------
+    if args.skip_terminal_screen:
+        confirmed_pairs = core_pairs & flank_pairs
+        log.info("4) Pares ORTÓLOGOS confirmados (núcleo + flanco, todos >=%.0f%%; etapa 1 ignorada): %d",
+                 args.min_pident, len(confirmed_pairs))
+    else:
+        confirmed_pairs = stage1_pairs & core_pairs & flank_pairs
+        log.info("4) Pares ORTÓLOGOS confirmados (screening + núcleo + flanco, todos >=%.0f%%): %d",
+                 args.min_pident, len(confirmed_pairs))
+
+    # ---------------- Montagem dos ortogrupos ----------------
+    log.info("5) Montando ortogrupos (grafo de pares confirmados)...")
+    G = nx.Graph()
+    G.add_nodes_from(all_helitrons.keys())
+    for pair in confirmed_pairs:
+        a, b = tuple(pair)
+        G.add_edge(a, b)
+
+    if args.require_clique:
+        groups = cliques_as_groups(G)
+    else:
+        groups = [c for c in nx.connected_components(G) if len(c) > 1]
+
+    log.info("   Ortogrupos com >=2 loci: %d", len(groups))
+
+    write_outputs(args.outdir, species_list, all_helitrons, confirmed_pairs, groups,
+                   core_df_f, flank_df_f, term_df_f)
+    log.info("Concluído. Resultados em: %s", args.outdir)
+
+
+def cliques_as_groups(G: nx.Graph) -> List[set]:
+    """Alternativa mais estrita: cada ortogrupo deve ser uma clique (todos-com-todos)."""
+    groups = []
+    for comp in nx.connected_components(G):
+        sub = G.subgraph(comp)
+        if len(comp) == 2:
+            groups.append(comp)
+            continue
+        cliques = list(nx.find_cliques(sub))
+        cliques.sort(key=len, reverse=True)
+        used = set()
+        for cl in cliques:
+            cl_set = set(cl)
+            if cl_set & used:
+                continue
+            if len(cl_set) > 1:
+                groups.append(cl_set)
+                used |= cl_set
+    return groups
+
+
+def write_empty_outputs(outdir: str):
+    pd.DataFrame(columns=["group_id", "species", "locus_id", "uid"]).to_csv(
+        os.path.join(outdir, "orthogroups.tsv"), sep="\t", index=False
+    )
+
+
+def write_outputs(
+    outdir: str,
+    species_list: List[SpeciesConfig],
+    all_helitrons: Dict[str, Helitron],
+    confirmed_pairs: set,
+    groups: List[set],
+    core_df_f: pd.DataFrame,
+    flank_df_f: pd.DataFrame,
+    term_df_f: pd.DataFrame,
+) -> None:
+    species_names = [sp.name for sp in species_list]
+
+    # --- tabela de pares ortólogos confirmados, com metadados ---
+    rows = []
+    for pair in confirmed_pairs:
+        a, b = tuple(pair)
+        ha, hb = all_helitrons[a], all_helitrons[b]
+        rows.append({
+            "species_A": ha.species, "locus_A": ha.locus_id, "chrom_A": ha.chrom,
+            "start_A": ha.start, "end_A": ha.end, "strand_A": ha.strand,
+            "species_B": hb.species, "locus_B": hb.locus_id, "chrom_B": hb.chrom,
+            "start_B": hb.start, "end_B": hb.end, "strand_B": hb.strand,
+        })
+    pairs_df = pd.DataFrame(rows)
+    pairs_df.to_csv(os.path.join(outdir, "orthologous_pairs.tsv"), sep="\t", index=False)
+
+    # --- tabela de ortogrupos (um locus por linha, agrupado por group_id) ---
+    group_rows = []
+    for i, group in enumerate(groups, 1):
+        gid = f"HelOG_{i:05d}"
+        for uid in group:
+            h = all_helitrons[uid]
+            group_rows.append({
+                "group_id": gid, "species": h.species, "locus_id": h.locus_id,
+                "uid": uid, "chrom": h.chrom, "start": h.start, "end": h.end, "strand": h.strand,
+            })
+    groups_df = pd.DataFrame(group_rows)
+    groups_df.to_csv(os.path.join(outdir, "orthogroups.tsv"), sep="\t", index=False)
+
+    # --- matriz de presença/ausência (contagem de loci por espécie x ortogrupo) ---
+    if not groups_df.empty:
+        presence = groups_df.pivot_table(
+            index="group_id", columns="species", values="locus_id", aggfunc="count", fill_value=0
+        ).reindex(columns=species_names, fill_value=0)
+        presence.to_csv(os.path.join(outdir, "presence_absence_matrix.tsv"), sep="\t")
+
+        # --- resumo de padrões de compartilhamento (útil p/ diferenciação) ---
+        pattern = presence.apply(lambda row: tuple(int(x > 0) for x in row), axis=1)
+        summary = pattern.value_counts().rename_axis("presence_pattern").reset_index(name="n_orthogroups")
+        summary["species_order"] = ",".join(species_names)
+        summary.to_csv(os.path.join(outdir, "sharing_pattern_summary.tsv"), sep="\t", index=False)
+    else:
+        log.warning("Nenhum ortogrupo com 2+ loci foi formado; verifique os cortes utilizados.")
+
+    # --- BLAST filtrados, para auditoria/inspeção ---
+    core_df_f.to_csv(os.path.join(outdir, "blast_core_filtered.tsv"), sep="\t", index=False)
+    flank_df_f.to_csv(os.path.join(outdir, "blast_flank_filtered.tsv"), sep="\t", index=False)
+    term_df_f.to_csv(os.path.join(outdir, "blast_terminal_junction_filtered.tsv"), sep="\t", index=False)
+
+
+if __name__ == "__main__":
+    try:
+        main()
+    except subprocess.CalledProcessError as e:
+        log.error("Comando externo falhou: %s\nstdout: %s\nstderr: %s", e.cmd, e.stdout, e.stderr)
+        sys.exit(1)
+    except Exception as e:
+        log.error("Erro: %s", e)
+        sys.exit(1)
 
