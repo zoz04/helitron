@@ -1,0 +1,23 @@
+#conferir o que há na coluna 3
+ dcanal@vm-pesq-Clarisse-OS23320:~/enzo/newHQhelitrons-intersect$ cut -f3 Psta_Helitrons_superHQ_v2.gff3 | grep -v '^#' | sort | uniq -c
+   4256 helitron
+(base) dcanal@vm-pesq-Clarisse-OS23320:~/enzo/newHQhelitrons-intersect$
+cut -f3 Palb_Helitrons_superHQ_v2.gff3 | grep -v '^#' | sort | uniq -c
+   2654 helitron
+
+# Tamanho do genoma sta 
+awk '{s+=$2} END{print s}' Psta.fa.fai
+558842600
+# Bases em Helitrons
+grep -v '^#' Psta_Helitrons_superHQ_v2.gff3 | awk -F'\t' '{s+=$5-$4+1} END{print s}'
+4453063
+(4453063/558842600) * 100 = 0,797%
+
+# Tamanho do genoma alb
+ awk '{s+=$2} END{print s}' Palb.fa.fai
+527176238
+# Bases em Helitrons
+grep -v '^#' Palb_Helitrons_superHQ_v2.gff3 | aw
+k -F'\t' '{s+=$5-$4+1} END{print s}'
+3224912
+(3224912/527176238) * 100 = 0,612%
